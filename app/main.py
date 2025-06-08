@@ -14,13 +14,15 @@ import logging
 import re
 import datetime
 import aiortc
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCIceCandidate
+from aiortc.sdp import candidate_from_sdp
+from aiortc.contrib.media import MediaBlackhole, MediaPlayer, MediaRecorder, MediaStreamError
 import av
 import traceback
 import numpy as np
 import wave
 import time
+from pydub import AudioSegment
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -29,44 +31,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create debug directory for audio files
+# Create debug directories
 DEBUG_AUDIO_DIR = "debug_audio"
+DEBUG_METADATA_DIR = os.path.join(DEBUG_AUDIO_DIR, "metadata")
 os.makedirs(DEBUG_AUDIO_DIR, exist_ok=True)
+os.makedirs(DEBUG_METADATA_DIR, exist_ok=True)
 
-def save_debug_audio(audio_data: np.ndarray, sample_rate: int = 16000, prefix: str = "audio") -> str:
-    """Save audio data to a WAV file for debugging."""
-    # Create debug directory if it doesn't exist
-    os.makedirs("debug_audio", exist_ok=True)
-    
-    # Generate timestamp for filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"debug_audio/{prefix}_{timestamp}.wav"
-    
-    # Ensure audio data is in the correct format
-    if audio_data.dtype != np.int16:
-        # Normalize to int16 range
-        max_val = np.max(np.abs(audio_data))
-        if max_val > 0:
-            audio_data = (audio_data / max_val * 32767).astype(np.int16)
-        else:
-            audio_data = audio_data.astype(np.int16)
-    
-    # Log audio statistics before saving
-    logger.info(f"Saving audio file {prefix}_{timestamp}.wav with stats: min={audio_data.min()}, max={audio_data.max()}, mean={audio_data.mean():.2f}, std={audio_data.std():.2f}")
-    
-    # Save as WAV file
-    with wave.open(filename, 'wb') as wav_file:
-        wav_file.setnchannels(1)  # Mono
-        wav_file.setsampwidth(2)  # 16-bit
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(audio_data.tobytes())
-    
-    logger.info(f"Saved debug audio to: {filename}")
-    return filename
+def save_debug_audio(audio_data: np.ndarray, sample_rate: int = 16000, prefix: str = "audio", metadata: dict = None) -> str:
+    """Save audio data to a WAV file for debugging with metadata."""
+    try:
+        # Generate timestamp for filename
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{DEBUG_AUDIO_DIR}/{prefix}_{timestamp}.wav"
+        metadata_filename = f"{DEBUG_METADATA_DIR}/{prefix}_{timestamp}.json"
+        
+        # Ensure audio data is in the correct format
+        if audio_data.dtype != np.int16:
+            # Normalize to int16 range
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 0:
+                audio_data = (audio_data / max_val * 32767).astype(np.int16)
+            else:
+                audio_data = audio_data.astype(np.int16)
+        
+        # Calculate audio statistics
+        audio_stats = {
+            "min": float(audio_data.min()),
+            "max": float(audio_data.max()),
+            "mean": float(audio_data.mean()),
+            "std": float(audio_data.std()),
+            "duration": len(audio_data) / sample_rate,
+            "sample_rate": sample_rate,
+            "timestamp": timestamp,
+            "filename": filename
+        }
+        
+        # Add any additional metadata
+        if metadata:
+            audio_stats.update(metadata)
+        
+        # Save audio statistics
+        with open(metadata_filename, 'w') as f:
+            json.dump(audio_stats, f, indent=2)
+        
+        # Log audio statistics
+        logger.info(f"Saving audio file {prefix}_{timestamp}.wav with stats: {json.dumps(audio_stats, indent=2)}")
+        
+        # Save as WAV file
+        with wave.open(filename, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_data.tobytes())
+        
+        logger.info(f"Saved debug audio to: {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Error saving debug audio: {e}")
+        return ""
 
 app = FastAPI(
-    title="Conversational AI Bot",
-    description="A modern conversational AI bot built with FastAPI and Ollama",
+    title="Secretary - Voice Assistant",
+    description="A modern voice assistant built with FastAPI and WebRTC",
     version="1.0.0"
 )
 
@@ -155,6 +181,80 @@ async def listen():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+async def process_audio(audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+    """Process audio data and return transcribed text."""
+    try:
+        # Calculate audio statistics from the original audio
+        audio_level = np.abs(audio_data).mean()
+        
+        # Save debug audio with metadata
+        metadata = {
+            "audio_level": float(audio_level),
+            "is_silence": bool(audio_level < 0.005),
+            "processing_timestamp": datetime.datetime.now().isoformat(),
+            "original_sample_rate": sample_rate
+        }
+        
+        # Save the ORIGINAL audio for debugging
+        save_debug_audio(audio_data, sample_rate, "original", metadata)
+        
+        # Check audio levels - using a more lenient threshold
+        if audio_level < 0.005:
+            logger.warning(f"Audio level too low ({audio_level:.2f}), skipping recognition")
+            return ""
+
+        # --- RESAMPLING STEP ---
+        # Create a pydub AudioSegment to make resampling easy
+        try:
+            original_segment = AudioSegment(
+                data=audio_data.tobytes(),
+                sample_width=2,  # int16 = 2 bytes
+                frame_rate=sample_rate,
+                channels=1
+            )
+            # Resample to 16kHz, which is ideal for most STT engines
+            resampled_segment = original_segment.set_frame_rate(16000)
+            resampled_audio_array = np.array(resampled_segment.get_array_of_samples())
+            
+            # Save the RESAMPLED audio for debugging
+            save_debug_audio(resampled_audio_array, 16000, "resampled", metadata)
+
+        except Exception as e:
+            logger.error(f"Error during audio resampling: {e}")
+            # Fallback to original audio if resampling fails
+            resampled_segment = original_segment
+            
+        # --- SPEECH RECOGNITION on RESAMPLED audio ---
+        logger.info("Attempting speech recognition on resampled audio...")
+        recognizer = sr.Recognizer()
+
+        # Create an AudioData object for the speech recognition library
+        audio_data_for_sr = sr.AudioData(
+            resampled_segment.raw_data,
+            sample_rate=16000, # Use the resampled rate
+            sample_width=2
+        )
+        
+        try:
+            text = recognizer.recognize_google(audio_data_for_sr)
+            logger.info(f"Recognized text: {text}")
+            
+            # Save successful recognition with text
+            metadata["recognized_text"] = text
+            save_debug_audio(np.array(resampled_segment.get_array_of_samples()), 16000, "recognized", metadata)
+            
+            return text
+        except sr.UnknownValueError:
+            logger.error(f"Speech recognition could not understand audio - Audio levels: min={audio_data.min()}, max={audio_data.max()}, mean={audio_data.mean()}, std={audio_data.std()}")
+            return ""
+        except sr.RequestError as e:
+            logger.error(f"Could not request results from speech recognition service: {e}")
+            return ""
+            
+    except Exception as e:
+        logger.error(f"Error processing audio: {e}")
+        return ""
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """
@@ -164,223 +264,153 @@ async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established")
     
-    # Initialize conversation history for this client
-    client_id = str(id(websocket))
-    conversation_history[client_id] = []
+    pc = None
+    audio_track = None
     
-    try:
+    async def consume_audio_track(track):
+        """A task to consume the audio track and perform VAD."""
+        # VAD parameters
+        VAD_THRESHOLD = 300  # Energy threshold for speech detection (based on int16 samples)
+        VAD_SILENCE_FRAMES = 25  # Frames of silence to end an utterance (e.g., 25 * 20ms = 500ms)
+        VAD_MIN_SPEECH_FRAMES = 5  # Min speech frames to be considered an utterance
+
+        is_speaking = False
+        silent_frames_count = 0
+        audio_buffer = bytearray()
+        speech_frames_count = 0
+
+        logger.info("Audio consumer task started.")
         while True:
             try:
-                # Wait for WebSocket messages
-                message = await websocket.receive_text()
-                logger.debug(f"Received WebSocket message: {message[:200]}...")  # Log first 200 chars
-                data = json.loads(message)
-                logger.debug(f"Parsed WebSocket data: {json.dumps(data, indent=2)}")
-                
-                if data["type"] == "offer":
-                    logger.info(f"Received WebRTC offer from client {client_id}")
-                    # Create peer connection
-                    pc = RTCPeerConnection()
-                    peer_connections[client_id] = pc
-                    
-                    # Set up audio handling
-                    @pc.on("track")
-                    async def on_track(track):
-                        if track.kind == "audio":
-                            logger.info(f"Received audio track from client {client_id}")
+                frame = await track.recv()
+            except MediaStreamError:
+                logger.info("Audio track ended.")
+                return
+            
+            # Convert audio frame to numpy array. This is compatible with older aiortc/PyAV.
+            audio_samples = frame.to_ndarray()
+
+            # If stereo, take one channel (though client should send mono).
+            if audio_samples.ndim > 1 and audio_samples.shape[0] > 1:
+                audio_samples = audio_samples[0, :]
+            
+            audio_samples = audio_samples.flatten()
+
+            # Ensure data is int16, which is what VAD and process_audio expect.
+            if audio_samples.dtype != np.int16:
+                # Common case from WebRTC is float, in [-1.0, 1.0] range.
+                audio_samples = (audio_samples * 32767).astype(np.int16)
+            
+            # Simple VAD based on Root Mean Square (RMS)
+            rms = np.sqrt(np.mean(np.square(audio_samples, dtype=np.float64)))
+
+            if is_speaking:
+                logger.info(f"Still speaking, rms: {rms}")
+                # We are in a speech segment
+                audio_buffer.extend(audio_samples.tobytes())
+                speech_frames_count += 1
+                if rms < VAD_THRESHOLD:
+                    silent_frames_count += 1
+                    if silent_frames_count > VAD_SILENCE_FRAMES:
+                        # End of utterance
+                        logger.info(f"End of speech detected. Processing {len(audio_buffer)} bytes.")
+                        if speech_frames_count > VAD_MIN_SPEECH_FRAMES:
+                            # Process the buffered audio
+                            logger.info(f"Processing {len(audio_buffer)} bytes. frame.sample_rate: {frame.sample_rate}")
+                            full_audio_data = np.frombuffer(audio_buffer, dtype=np.int16)
+                            text = await process_audio(full_audio_data, sample_rate=frame.sample_rate)
+                            logger.info(f"Processed audio data: {text}")
                             
-                            # Create a temporary file for recording
-                            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                                recorder = MediaRecorder(temp_file.name)
-                                recorder.addTrack(track)
-                                await recorder.start()
-                                
-                                # Process audio frames
-                                audio_frames = []
-                                last_process_time = time.time()
-                                min_buffer_duration = 1.0  # Minimum buffer duration in seconds
-                                process_interval = 0.5     # Process every 500ms
-                                max_retries = 3
-                                retry_count = 0
-                                
-                                while True:
-                                    try:
-                                        frame = await track.recv()
-                                        retry_count = 0  # Reset retry count on successful frame
-                                        
-                                        # Convert frame to numpy array
-                                        audio_data = np.frombuffer(frame.planes[0], dtype=np.int16)
-                                        audio_data = audio_data.reshape(1, -1)  # Reshape to (1, samples)
-                                        
-                                        # Log audio frame details
-                                        logger.info(f"Received audio frame: shape={audio_data.shape}, dtype={audio_data.dtype}, min={audio_data.min()}, max={audio_data.max()}, mean={audio_data.mean():.2f}, std={audio_data.std():.2f}")
-                                        
-                                        # Check audio levels - match client's noise gate threshold
-                                        mean_abs = np.mean(np.abs(audio_data))
-                                        if mean_abs < 0.1 * 32767:  # Convert client's 0.1 threshold to int16 range
-                                            logger.warning(f"Audio level too low ({mean_abs:.2f}), skipping recognition")
-                                            continue
-                                        
-                                        # Normalize audio data with dynamic gain control
-                                        max_val = np.max(np.abs(audio_data))
-                                        if max_val > 0:
-                                            # Calculate gain to match client's compressor settings
-                                            target_peak = 0.8 * 32767  # 80% of int16 max
-                                            gain = min(target_peak / max_val, 4.0)  # Match client's compression ratio
-                                            audio_data = (audio_data * gain).astype(np.int16)
-                                            logger.info(f"Applied gain: {gain:.2f}x, new levels - min={audio_data.min()}, max={audio_data.max()}, mean={audio_data.mean():.2f}, std={audio_data.std():.2f}")
-                                        
-                                        audio_frames.append(audio_data)
-                                        
-                                        # Process accumulated frames
-                                        current_time = time.time()
-                                        if (current_time - last_process_time >= process_interval and 
-                                            len(audio_frames) * audio_data.shape[1] / 16000 >= min_buffer_duration):
-                                            
-                                            # Combine frames
-                                            combined_audio = np.concatenate(audio_frames, axis=1)
-                                            logger.info(f"Combined audio shape: {combined_audio.shape}, dtype: {combined_audio.dtype}, min={combined_audio.min()}, max={combined_audio.max()}, mean={combined_audio.mean():.2f}, std={combined_audio.std():.2f}")
-                                            
-                                            # Save raw audio for debugging
-                                            raw_file = save_debug_audio(combined_audio, prefix="raw")
-                                            
-                                            # Save normalized audio
-                                            normalized_file = save_debug_audio(combined_audio, prefix="normalized")
-                                            
-                                            # Attempt speech recognition
-                                            logger.info("Attempting speech recognition...")
-                                            try:
-                                                # Convert to bytes for recognition
-                                                audio_bytes = combined_audio.tobytes()
-                                                
-                                                # Perform speech recognition
-                                                result = recognizer.recognize_google(audio_bytes, language="en-US")
-                                                
-                                                if result:
-                                                    logger.info(f"Recognized text: {result}")
-                                                    # Save successful recognition audio
-                                                    success_file = save_debug_audio(combined_audio, prefix="success")
-                                                    
-                                                    # Send result to client
-                                                    await websocket.send_json({
-                                                        "type": "transcription",
-                                                        "text": result
-                                                    })
-                                            except sr.UnknownValueError:
-                                                logger.error(f"Speech recognition could not understand audio - Audio levels: min={combined_audio.min()}, max={combined_audio.max()}, mean={combined_audio.mean():.2f}, std={combined_audio.std():.2f}")
-                                            except Exception as e:
-                                                logger.error(f"Error during speech recognition: {str(e)}")
-                                                
-                                            # Clear processed frames
-                                            audio_frames = []
-                                            last_process_time = current_time
-                                            
-                                    except MediaStreamError as e:
-                                        retry_count += 1
-                                        logger.warning(f"MediaStreamError occurred (attempt {retry_count}/{max_retries}): {str(e)}")
-                                        
-                                        if retry_count >= max_retries:
-                                            logger.error("Max retries reached for MediaStreamError, ending track processing")
-                                            break
-                                        
-                                        await asyncio.sleep(0.1)  # Small delay before retry
-                                        continue
-                                        
-                                    except Exception as e:
-                                        logger.error(f"Error receiving audio frame: {str(e)}")
-                                        break
-                                
-                                await recorder.stop()
-                                os.unlink(temp_file.name)
-                    
-                    # Set the remote description
-                    offer = RTCSessionDescription(
-                        sdp=data["sdp"]['sdp'],
-                        type=data["type"]
-                    )
-                    await pc.setRemoteDescription(offer)
-                    
-                    # Create and send answer
-                    answer = await pc.createAnswer()
-                    await pc.setLocalDescription(answer)
-                    
+                            if text:
+                                await websocket.send_json({"type": "transcription", "text": text})
+                        # Reset for next utterance
+                        is_speaking = False
+                        audio_buffer.clear()
+                        speech_frames_count = 0
+                else:
+                    # Still speaking, reset silence counter
+                    silent_frames_count = 0
+            else:
+                # We are in a silence segment
+                if rms > VAD_THRESHOLD:
+                    # Start of utterance
+                    logger.info("Start of speech detected.")
+                    is_speaking = True
+                    silent_frames_count = 0
+                    speech_frames_count = 1
+                    audio_buffer.extend(audio_samples.tobytes())
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message["type"] == "offer":
+                logger.info(f"Received WebRTC offer from client {id(websocket)}")
+                pc = RTCPeerConnection()
+                
+                @pc.on("track")
+                async def on_track(track):
+                    nonlocal audio_track
+                    if track.kind == "audio":
+                        logger.info(f"Received audio track from client {id(websocket)}")
+                        audio_track = track
+                        # Start a task to consume the audio track
+                        asyncio.create_task(consume_audio_track(track))
+                
+                # Set the remote description
+                await pc.setRemoteDescription(RTCSessionDescription(
+                    sdp=message["sdp"],
+                    type=message["type"]
+                ))
+                
+                # Create and send answer
+                answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                
+                await websocket.send_json({
+                    "type": "answer",
+                    "sdp": pc.localDescription.sdp
+                })
+                
+            elif message["type"] == "candidate":
+                if pc and pc.remoteDescription and message.get("candidate"):
                     try:
-                        answer_message = {
-                            "type": "answer",
-                            "sdp": pc.localDescription.sdp,
-                            "type": pc.localDescription.type
-                        }
-                        logger.debug(f"Sending WebRTC answer: {json.dumps(answer_message, indent=2)}")
-                        await websocket.send_json(answer_message)
-                    except WebSocketDisconnect:
-                        logger.info("WebSocket disconnected during answer")
-                        return
+                        candidate_obj = message.get("candidate", {})
+                        candidate_sdp = candidate_obj.get("candidate")
+
+                        if not candidate_sdp:
+                            logger.warning("Received and ignoring an empty ICE candidate. This is normal.")
+                            continue
+                        
+                        logger.info(f"Received ICE candidate from client {id(websocket)}")
+
+                        # Use the official aiortc SDP parser to create the candidate.
+                        candidate = candidate_from_sdp(candidate_sdp)
+                        
+                        # The parser doesn't know about sdpMid or sdpMLineIndex, so add them manually.
+                        candidate.sdpMid = candidate_obj.get("sdpMid")
+                        candidate.sdpMLineIndex = candidate_obj.get("sdpMLineIndex")
+
+                        await pc.addIceCandidate(candidate)
+                    except Exception as e:
+                        logger.error(f"Error adding ICE candidate: {e}")
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": f"Failed to add ICE candidate: {str(e)}"
+                        })
                     
-                elif data["type"] == "ice-candidate":
-                    if client_id in peer_connections:
-                        pc = peer_connections[client_id]
-                        try:
-                            # Parse the ICE candidate string
-                            candidate_str = data["candidate"]["candidate"]
-                            sdp_mid = data["candidate"]["sdpMid"]
-                            sdp_mline_index = data["candidate"]["sdpMLineIndex"]
-                            
-                            logger.debug(f"Processing ICE candidate: {candidate_str}")
-                            logger.debug(f"sdpMid: {sdp_mid}, sdpMLineIndex: {sdp_mline_index}")
-                            
-                            # Parse ICE candidate components
-                            candidate_parts = parse_ice_candidate(candidate_str)
-                            
-                            # Create ICE candidate
-                            candidate = aiortc.RTCIceCandidate(
-                                component=candidate_parts['component'],
-                                foundation=candidate_parts['foundation'],
-                                priority=candidate_parts['priority'],
-                                protocol=candidate_parts['protocol'],
-                                relatedAddress=candidate_parts['related_address'],
-                                relatedPort=candidate_parts['related_port'],
-                                sdpMid=sdp_mid,
-                                sdpMLineIndex=sdp_mline_index,
-                                tcpType=None,
-                                type=candidate_parts['type'],
-                                ip=candidate_parts['ip'],
-                                port=candidate_parts['port']
-                            )
-                            await pc.addIceCandidate(candidate)
-                            logger.info(f"Added ICE candidate for client {client_id}")
-                        except Exception as e:
-                            logger.error(f"Error adding ICE candidate: {str(e)}")
-                            logger.error(f"Stack trace: {traceback.format_exc()}")
-                            logger.error(f"Candidate data: {json.dumps(data['candidate'], indent=2)}")
-                
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected for client {client_id}")
-                break
-            except Exception as e:
-                logger.error(f"Error handling WebSocket message: {str(e)}")
-                logger.error(f"Stack trace: {traceback.format_exc()}")
-                try:
-                    await websocket.send_json({
-                        "type": "error",
-                        "content": str(e)
-                    })
-                except WebSocketDisconnect:
-                    break
-                
     except WebSocketDisconnect:
-        logger.info(f"WebSocket connection closed for client {client_id}")
+        logger.info(f"WebSocket disconnected for client {id(websocket)}")
     except Exception as e:
-        logger.error(f"Unexpected error in WebSocket handler: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
+        logger.error(f"Error in WebSocket connection: {e}")
+        await websocket.send_json({
+            "type": "error",
+            "error": str(e)
+        })
     finally:
-        # Clean up WebRTC connection
-        if client_id in peer_connections:
-            pc = peer_connections[client_id]
+        if pc:
             await pc.close()
-            del peer_connections[client_id]
-        # Clean up conversation history
-        if client_id in conversation_history:
-            del conversation_history[client_id]
 
 @app.get("/")
 async def read_root():
