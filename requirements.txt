@@ -1,0 +1,13 @@
+python-dotenv==1.0.1
+fastapi==0.109.2
+uvicorn==0.27.1
+pydantic==2.6.1
+python-multipart==0.0.9
+requests==2.31.0
+pydantic-settings==2.2.1
+SpeechRecognition==3.10.1
+numpy==1.26.4
+aiortc==1.5.0
+websockets==12.0
+aioice==0.9.0
+av==10.0.0 

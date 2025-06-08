@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Voice Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #messages {
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-bottom: 20px;
+        }
+        .message {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .user-message {
+            background-color: #e3f2fd;
+            margin-left: 20%;
+        }
+        .assistant-message {
+            background-color: #f5f5f5;
+            margin-right: 20%;
+        }
+        #status {
+            color: #666;
+            font-style: italic;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #micStatus {
+            margin-top: 10px;
+            font-weight: bold;
+        }
+        .recording {
+            color: #ff0000;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Voice Chat</h1>
+    <div id="messages"></div>
+    <div id="status">Disconnected</div>
+    <div id="micStatus">Microphone: Not Ready</div>
+    <button id="startButton">Start Conversation</button>
+    <button id="stopButton" disabled>Stop Conversation</button>
+
+    <script>
+        let ws = null;
+        let peerConnection = null;
+        let audioStream = null;
+        const messagesDiv = document.getElementById('messages');
+        const statusDiv = document.getElementById('status');
+        const micStatusDiv = document.getElementById('micStatus');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+
+        // WebRTC configuration
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ]
+        };
+
+        function addMessage(text, isUser = false) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user-message' : 'assistant-message'}`;
+            messageDiv.textContent = text;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function updateStatus(text) {
+            statusDiv.textContent = text;
+        }
+
+        function updateMicStatus(text, isRecording = false) {
+            micStatusDiv.textContent = `Microphone: ${text}`;
+            if (isRecording) {
+                micStatusDiv.classList.add('recording');
+            } else {
+                micStatusDiv.classList.remove('recording');
+            }
+        }
+
+        async function setupWebRTC() {
+            try {
+                console.log('Setting up WebRTC...');
+                
+                // Get audio stream
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        sampleSize: 16
+                    }
+                });
+
+                // Create audio context with matching sample rate
+                const audioContext = new AudioContext({
+                    sampleRate: 16000,
+                    latencyHint: 'interactive'
+                });
+
+                // Set up audio constraints to match server expectations
+                const audioConstraints = {
+                    sampleRate: 16000,
+                    sampleSize: 16,
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                };
+
+                // Create audio processing nodes
+                const source = audioContext.createMediaStreamSource(audioStream);
+                const highPassFilter = audioContext.createBiquadFilter();
+                highPassFilter.type = 'highpass';
+                highPassFilter.frequency.value = 80;  // Keep this to reduce low-frequency noise
+
+                const compressor = audioContext.createDynamicsCompressor();
+                compressor.threshold.value = -30;      // Lower threshold to match server's sensitivity
+                compressor.ratio.value = 4;            // Keep moderate compression
+                compressor.attack.value = 0.003;       // Fast attack
+                compressor.release.value = 0.25;       // Moderate release
+                compressor.knee.value = 30;            // Smooth transition
+
+                // Create gain node for noise gate
+                const gainNode = audioContext.createGain();
+                gainNode.gain.value = 1.0;
+
+                // Create analyzer for level detection
+                const analyzer = audioContext.createAnalyser();
+                analyzer.fftSize = 2048;
+                const bufferLength = analyzer.frequencyBinCount;
+                const dataArray = new Float32Array(bufferLength);
+
+                // Connect audio processing nodes
+                source.connect(highPassFilter);
+                //highPassFilter.connect(compressor);
+                //compressor.connect(gainNode);
+                //gainNode.connect(analyzer);
+                analyzer.connect(audioContext.destination);
+
+                // Implement noise gate with matching threshold
+                const noiseGateThreshold = 0.1;  // Increased to match server's sensitivity
+                const minGain = 0.5;             // Keep minimum gain to prevent complete silence
+                const attackTime = 0.05;          // 50ms attack
+                const releaseTime = 0.1;          // 100ms release
+                let currentGain = 1.0;
+
+                // Process audio levels every 50ms
+                setInterval(() => {
+                    analyzer.getFloatTimeDomainData(dataArray);
+                    const rms = Math.sqrt(dataArray.reduce((acc, val) => acc + val * val, 0) / bufferLength);
+                    
+                    // Calculate target gain based on RMS level
+                    let targetGain = 1.0;
+                    if (rms < noiseGateThreshold) {
+                        targetGain = minGain + (rms / noiseGateThreshold) * (1.0 - minGain);
+                    }
+                    
+                    // Smooth gain changes
+                    const gainDiff = targetGain - currentGain;
+                    if (Math.abs(gainDiff) > 0.01) {
+                        currentGain += gainDiff * (gainDiff > 0 ? attackTime : releaseTime);
+                        gainNode.gain.value = currentGain;
+                    }
+
+                    // Log audio levels for debugging
+                    console.log(`Audio levels - RMS: ${rms.toFixed(4)}, Gain: ${currentGain.toFixed(2)}`);
+                }, 50);
+
+                // Create a new MediaStream from the processed audio
+                const processedStream = audioContext.createMediaStreamDestination();
+                gainNode.connect(processedStream);
+
+                // Add the processed audio track to the peer connection
+                const audioTrack = processedStream.stream.getAudioTracks()[0];
+                console.log('Audio track settings:', audioTrack.getSettings());
+                peerConnection.addTrack(audioTrack, processedStream.stream);
+
+                // Log audio stats periodically
+                setInterval(() => {
+                    if (peerConnection && peerConnection.getSenders().length > 0) {
+                        const sender = peerConnection.getSenders()[0];
+                        if (sender.track) {
+                            console.log('Audio track stats:', {
+                                kind: sender.track.kind,
+                                enabled: sender.track.enabled,
+                                muted: sender.track.muted,
+                                readyState: sender.track.readyState
+                            });
+                        }
+                    }
+                }, 1000);
+
+                // Handle ICE candidates
+                peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        console.log('Sending ICE candidate to server');
+                        ws.send(JSON.stringify({
+                            type: 'ice-candidate',
+                            candidate: event.candidate
+                        }));
+                    }
+                };
+
+                // Handle connection state changes
+                peerConnection.onconnectionstatechange = () => {
+                    console.log('Connection state:', peerConnection.connectionState);
+                    updateStatus(`WebRTC: ${peerConnection.connectionState}`);
+                };
+
+                // Create and send offer
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                console.log('Sending offer to server');
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    sdp: peerConnection.localDescription
+                }));
+
+                updateMicStatus('Ready');
+                return true;
+            } catch (error) {
+                console.error('Error setting up WebRTC:', error);
+                updateMicStatus('Error: ' + error.message);
+                return false;
+            }
+        }
+
+        async function startConversation() {
+            console.log('Starting conversation...');
+            
+            ws = new WebSocket('ws://localhost:8000/ws/chat');
+            
+            ws.onopen = async () => {
+                console.log('WebSocket connection established');
+                updateStatus('Connected');
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                addMessage('Connected to server. Start speaking...');
+                
+                // Setup WebRTC after WebSocket connection
+                const rtcReady = await setupWebRTC();
+                if (!rtcReady) {
+                    addMessage('Failed to setup audio streaming. Please check permissions and try again.');
+                    return;
+                }
+                updateMicStatus('Recording', true);
+            };
+
+            ws.onmessage = async (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch (data.type) {
+                        case 'answer':
+                            console.log('Received answer from server');
+                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+                            break;
+                            
+                        case 'ice-candidate':
+                            console.log('Received ICE candidate from server');
+                            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                            break;
+                            
+                        case 'text':
+                            addMessage(data.content, false);
+                            break;
+                            
+                        case 'error':
+                            addMessage('Error: ' + data.content, 'error');
+                            break;
+                            
+                        case 'ping':
+                            console.log('Received ping from server');
+                            ws.send(JSON.stringify({ type: 'pong' }));
+                            break;
+                    }
+                } catch (e) {
+                    console.error('Failed to handle message:', e);
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket connection closed');
+                updateStatus('Disconnected');
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                updateMicStatus('Not Ready');
+                addMessage('Disconnected from server');
+                cleanupWebRTC();
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('Error: ' + error.message);
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                updateMicStatus('Error');
+                addMessage('Error: ' + error.message);
+            };
+        }
+
+        function cleanupWebRTC() {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+        }
+
+        function stopConversation() {
+            console.log('Stopping conversation...');
+            cleanupWebRTC();
+            if (ws) {
+                console.log('Closing WebSocket connection...');
+                ws.close();
+            }
+            updateMicStatus('Not Ready');
+        }
+
+        startButton.onclick = startConversation;
+        stopButton.onclick = stopConversation;
+    </script>
+</body>
+</html> 
